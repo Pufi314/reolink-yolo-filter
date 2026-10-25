@@ -20,6 +20,8 @@ RUN pip install --no-cache-dir --index-url https://pypi.org/simple \
 
 COPY watcher.py .
 
-RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')" \
+    && chmod 755 /app \
+    && chmod 644 /app/watcher.py /app/yolov8n.pt
 
 CMD ["python", "watcher.py"]
