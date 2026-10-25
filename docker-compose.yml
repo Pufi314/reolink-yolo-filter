@@ -1,0 +1,14 @@
+services:
+  reolink-alert-filter:
+    build: .
+    container_name: reolink-alert-filter
+    restart: unless-stopped
+    user: "${PUID:-1026}:${PGID:-100}"
+    env_file:
+      - .env
+    environment:
+      ARCHIVE_DIR: /data/archive
+      YOLO_CONFIG_DIR: /data/model-cache
+    volumes:
+      - ./data/archive:/data/archive
+      - ./data/model-cache:/data/model-cache
