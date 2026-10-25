@@ -7,8 +7,6 @@ services:
     env_file:
       - .env
     environment:
-      ARCHIVE_DIR: /data/archive
       YOLO_CONFIG_DIR: /data/model-cache
     volumes:
-      - ./data/archive:/data/archive
       - ./data/model-cache:/data/model-cache

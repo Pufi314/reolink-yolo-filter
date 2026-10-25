@@ -2,20 +2,16 @@
 
 from __future__ import annotations
 
-import hashlib
 import imaplib
 import logging
 import os
 import smtplib
 import ssl
-import tempfile
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from email import message_from_bytes
 from email.message import EmailMessage, Message
 from email.policy import default
-from email.utils import parsedate_to_datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Mapping
@@ -40,7 +36,6 @@ class Config:
     smtp_password: str
     target_email: str
     confidence_threshold: float
-    archive_dir: Path
     poll_interval_seconds: int
     reconnect_delay_seconds: int
 
@@ -86,7 +81,6 @@ class Config:
             smtp_password=values["SMTP_PASSWORD"],
             target_email=values["TARGET_EMAIL"],
             confidence_threshold=confidence,
-            archive_dir=Path(values.get("ARCHIVE_DIR", "/data/archive")),
             poll_interval_seconds=poll_interval,
             reconnect_delay_seconds=reconnect_delay,
         )
@@ -176,89 +170,21 @@ def send_alert(config: Config, subject: str, image_name: str, image_bytes: bytes
         client.send_message(email)
 
 
-def archive_image(
-    archive_dir: Path,
-    image_bytes: bytes,
-    message_uid: str,
-    message_id: str,
-    part_number: int,
-    received_at: datetime,
-) -> Path:
-    target = _archive_path(archive_dir, image_bytes, message_uid, message_id, part_number, received_at)
-    target_dir = target.parent
-    target_dir.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        return target
-
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(dir=target_dir, prefix=".incoming-", delete=False) as temporary:
-            temporary_path = Path(temporary.name)
-            temporary.write(image_bytes)
-        os.replace(temporary_path, target)
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-    return target
-
-
 def process_message(imap: imaplib.IMAP4_SSL, config: Config, model: object, uid: str, raw_message: bytes) -> None:
     message = message_from_bytes(raw_message, policy=default)
     subject = str(message.get("Subject", "Reolink camera alert"))
-    message_id = str(message.get("Message-ID", ""))
-    received_at = _message_date(message)
     attachments = extract_jpeg_attachments(message)
 
-    for part_number, (filename, image_bytes) in enumerate(attachments, start=1):
+    for filename, image_bytes in attachments:
         alert_type = classify_image(model, image_bytes, config.confidence_threshold)
         if alert_type is None:
             continue
 
-        archive_path = _archive_path(
-            config.archive_dir, image_bytes, uid, message_id, part_number, received_at
-        )
-        if archive_path.exists():
-            continue
-
         send_alert(config, subject, filename, image_bytes, alert_type)
-        archive_image(config.archive_dir, image_bytes, uid, message_id, part_number, received_at)
 
     status, _ = imap.uid("STORE", uid, "+FLAGS.SILENT", "(\\Seen)")
     if status != "OK":
         raise imaplib.IMAP4.error(f"Could not mark message {uid} as processed")
-
-
-def _archive_path(
-    archive_dir: Path,
-    image_bytes: bytes,
-    message_uid: str,
-    message_id: str,
-    part_number: int,
-    received_at: datetime,
-) -> Path:
-    uid_token = hashlib.sha256(message_uid.encode("utf-8")).hexdigest()[:12]
-    message_token = hashlib.sha256((message_id or message_uid).encode("utf-8")).hexdigest()[:12]
-    image_token = hashlib.sha256(image_bytes).hexdigest()[:12]
-    return (
-        archive_dir
-        / received_at.strftime("%Y")
-        / received_at.strftime("%m")
-        / received_at.strftime("%d")
-        / f"uid-{uid_token}-{message_token}-part-{part_number}-{image_token}.jpg"
-    )
-
-
-def _message_date(message: Message) -> datetime:
-    date_header = message.get("Date")
-    if date_header:
-        try:
-            received_at = parsedate_to_datetime(str(date_header))
-            if received_at.tzinfo is None:
-                received_at = received_at.replace(tzinfo=timezone.utc)
-            return received_at.astimezone(timezone.utc)
-        except (TypeError, ValueError, OverflowError):
-            LOGGER.warning("Invalid email Date header; using current UTC time")
-    return datetime.now(timezone.utc)
 
 
 def poll_once(config: Config, model: object) -> None:

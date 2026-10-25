@@ -1,7 +1,7 @@
 import io
+import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,7 +44,7 @@ class FakeImap:
         return "OK", []
 
 
-def config_for(archive_dir: Path) -> watcher.Config:
+def config_for() -> watcher.Config:
     return watcher.Config(
         imap_server="imap.example.com",
         imap_user="inbox@example.com",
@@ -55,7 +55,6 @@ def config_for(archive_dir: Path) -> watcher.Config:
         smtp_password="secret",
         target_email="recipient@example.com",
         confidence_threshold=0.5,
-        archive_dir=archive_dir,
         poll_interval_seconds=15,
         reconnect_delay_seconds=30,
     )
@@ -80,7 +79,7 @@ class ClassificationTests(unittest.TestCase):
 
 
 class MessageProcessingTests(unittest.TestCase):
-    def test_each_qualifying_attachment_is_sent_and_archived(self):
+    def test_each_qualifying_attachment_is_sent(self):
         email = EmailMessage()
         email["Subject"] = "Motion detected"
         email["Message-ID"] = "<camera-1@example.com>"
@@ -89,7 +88,7 @@ class MessageProcessingTests(unittest.TestCase):
         email.add_attachment(jpeg_bytes("red"), maintype="image", subtype="jpeg", filename="one.jpg")
         email.add_attachment(jpeg_bytes("blue"), maintype="image", subtype="jpeg", filename="two.jpg")
         imap = FakeImap()
-        config = config_for(Path(tempfile.mkdtemp()))
+        config = config_for()
 
         with patch.object(watcher, "classify_image", side_effect=["person", "animal"]) as classify:
             with patch.object(watcher, "send_alert") as send:
@@ -97,8 +96,25 @@ class MessageProcessingTests(unittest.TestCase):
 
         self.assertEqual(classify.call_count, 2)
         self.assertEqual([call.args[4] for call in send.call_args_list], ["person", "animal"])
-        self.assertEqual(len(list(config.archive_dir.rglob("*.jpg"))), 2)
         self.assertEqual(imap.calls[-1], ("STORE", "42", "+FLAGS.SILENT", "(\\Seen)"))
+
+    def test_processing_does_not_write_images_to_disk(self):
+        email = EmailMessage()
+        email.set_content("Camera alert")
+        email.add_attachment(jpeg_bytes(), maintype="image", subtype="jpeg", filename="person.jpg")
+        imap = FakeImap()
+        config = config_for()
+
+        with tempfile.TemporaryDirectory() as working_dir:
+            original_cwd = Path.cwd()
+            try:
+                os.chdir(working_dir)
+                with patch.object(watcher, "classify_image", return_value="person"):
+                    with patch.object(watcher, "send_alert"):
+                        watcher.process_message(imap, config, object(), "46", email.as_bytes())
+                self.assertEqual(list(Path(working_dir).iterdir()), [])
+            finally:
+                os.chdir(original_cwd)
 
     def test_discarded_message_is_marked_processed_without_notification(self):
         email = EmailMessage()
@@ -106,49 +122,31 @@ class MessageProcessingTests(unittest.TestCase):
         email.set_content("Camera alert")
         email.add_attachment(jpeg_bytes(), maintype="image", subtype="jpeg", filename="false-trigger.jpg")
         imap = FakeImap()
-        config = config_for(Path(tempfile.mkdtemp()))
+        config = config_for()
 
         with patch.object(watcher, "classify_image", return_value=None):
             with patch.object(watcher, "send_alert") as send:
                 watcher.process_message(imap, config, object(), "43", email.as_bytes())
 
         send.assert_not_called()
-        self.assertEqual(list(config.archive_dir.rglob("*.jpg")), [])
         self.assertEqual(imap.calls[-1][0], "STORE")
-
-    def test_retry_after_archive_does_not_send_the_same_image_twice(self):
-        email = EmailMessage()
-        email["Message-ID"] = "<camera-retry@example.com>"
-        email.set_content("Camera alert")
-        email.add_attachment(jpeg_bytes(), maintype="image", subtype="jpeg", filename="person.jpg")
-        imap = FakeImap()
-        config = config_for(Path(tempfile.mkdtemp()))
-
-        with patch.object(watcher, "classify_image", return_value="person"):
-            with patch.object(watcher, "send_alert") as send:
-                watcher.process_message(imap, config, object(), "45", email.as_bytes())
-                watcher.process_message(imap, config, object(), "45", email.as_bytes())
-
-        send.assert_called_once()
-        self.assertEqual(len(list(config.archive_dir.rglob("*.jpg"))), 1)
 
     def test_delivery_failure_leaves_message_unprocessed(self):
         email = EmailMessage()
         email.set_content("Camera alert")
         email.add_attachment(jpeg_bytes(), maintype="image", subtype="jpeg", filename="person.jpg")
         imap = FakeImap()
-        config = config_for(Path(tempfile.mkdtemp()))
+        config = config_for()
 
         with patch.object(watcher, "classify_image", return_value="person"):
             with patch.object(watcher, "send_alert", side_effect=OSError("SMTP unavailable")):
                 with self.assertRaises(OSError):
                     watcher.process_message(imap, config, object(), "44", email.as_bytes())
-
         self.assertEqual(imap.calls, [])
-        self.assertEqual(list(config.archive_dir.rglob("*.jpg")), [])
+        self.assertEqual(imap.calls, [])
 
     def test_alert_email_uses_class_prefix_and_authenticated_starttls(self):
-        config = config_for(Path(tempfile.mkdtemp()))
+        config = config_for()
         smtp = MagicMock()
         smtp.__enter__.return_value = smtp
 
@@ -163,7 +161,7 @@ class MessageProcessingTests(unittest.TestCase):
 
 class RetryTests(unittest.TestCase):
     def test_run_forever_retries_after_a_transient_poll_failure(self):
-        config = config_for(Path(tempfile.mkdtemp()))
+        config = config_for()
         with patch.object(watcher, "poll_once", side_effect=[OSError("offline"), None]) as poll:
             with patch.object(watcher.time, "sleep", side_effect=[None, KeyboardInterrupt]):
                 with self.assertLogs(watcher.LOGGER.name, level="ERROR"):
