@@ -61,27 +61,54 @@ def config_for() -> watcher.Config:
 
 
 class ClassificationTests(unittest.TestCase):
-    def test_person_detection_takes_precedence_over_animal(self):
+    def test_person_detection_is_forwardable(self):
+        model = FakeModel([FakeBox(0, 0.8)])
+        self.assertTrue(watcher.has_qualifying_detection(model, jpeg_bytes(), 0.5))
+
+    def test_person_and_animal_detections_both_match(self):
         model = FakeModel([FakeBox(1, 0.95), FakeBox(0, 0.8)])
-        self.assertEqual(watcher.classify_image(model, jpeg_bytes(), 0.5), "person")
+        self.assertTrue(watcher.has_qualifying_detection(model, jpeg_bytes(), 0.5))
 
     def test_animal_detection_is_forwardable(self):
         model = FakeModel([FakeBox(2, 0.78)])
-        self.assertEqual(watcher.classify_image(model, jpeg_bytes(), 0.5), "animal")
+        self.assertTrue(watcher.has_qualifying_detection(model, jpeg_bytes(), 0.5))
 
-    def test_low_confidence_person_does_not_hide_animal(self):
-        model = FakeModel([FakeBox(0, 0.2), FakeBox(1, 0.7)])
-        self.assertEqual(watcher.classify_image(model, jpeg_bytes(), 0.5), "animal")
+    def test_low_confidence_person_is_not_a_qualifying_detection(self):
+        model = FakeModel([FakeBox(0, 0.2)])
+        self.assertFalse(watcher.has_qualifying_detection(model, jpeg_bytes(), 0.5))
 
     def test_non_animal_detection_is_discarded(self):
         model = FakeModel([FakeBox(3, 0.99)])
-        self.assertIsNone(watcher.classify_image(model, jpeg_bytes(), 0.5))
+        self.assertFalse(watcher.has_qualifying_detection(model, jpeg_bytes(), 0.5))
+
+
+class ForwardedSubjectTests(unittest.TestCase):
+    def test_uses_camera_only_subject_for_each_known_camera(self):
+        subjects = {
+            "An alarm from Sprcha.": "Sprcha",
+            "PIR Alarm for Chata at 12:00": "Chata",
+            "An alarm from Altanok.": "Altanok",
+            "[PIR] Detected from Sad at 12:00": "Sad",
+            "An alarm from Gang.": "Gang",
+        }
+        for subject, camera_name in subjects.items():
+            with self.subTest(subject=subject):
+                self.assertEqual(watcher.forwarded_subject_from_source(subject), f"[{camera_name}]")
+
+    def test_falls_back_to_original_subject_if_camera_name_is_missing(self):
+        source_subject = "Unknown camera triggered at 12:00"
+        self.assertEqual(watcher.forwarded_subject_from_source(source_subject), source_subject)
+
+    def test_camera_name_matching_is_case_insensitive_and_requires_whole_word(self):
+        self.assertEqual(watcher.forwarded_subject_from_source("pir alarm for cHaTa"), "[Chata]")
+        source_subject = "An alarm from Chatan"
+        self.assertEqual(watcher.forwarded_subject_from_source(source_subject), source_subject)
 
 
 class MessageProcessingTests(unittest.TestCase):
     def test_each_qualifying_attachment_is_sent(self):
         email = EmailMessage()
-        email["Subject"] = "Motion detected"
+        email["Subject"] = "An alarm from Sprcha."
         email["Message-ID"] = "<camera-1@example.com>"
         email["Date"] = "Sun, 25 Oct 2026 12:00:00 +0000"
         email.set_content("Camera alert")
@@ -90,16 +117,17 @@ class MessageProcessingTests(unittest.TestCase):
         imap = FakeImap()
         config = config_for()
 
-        with patch.object(watcher, "classify_image", side_effect=["person", "animal"]) as classify:
+        with patch.object(watcher, "has_qualifying_detection", side_effect=[True, True]) as classify:
             with patch.object(watcher, "send_alert") as send:
                 watcher.process_message(imap, config, object(), "42", email.as_bytes())
 
         self.assertEqual(classify.call_count, 2)
-        self.assertEqual([call.args[4] for call in send.call_args_list], ["person", "animal"])
+        self.assertEqual([call.args[1] for call in send.call_args_list], ["[Sprcha]", "[Sprcha]"])
         self.assertEqual(imap.calls[-1], ("STORE", "42", "+FLAGS.SILENT", "(\\Seen)"))
 
     def test_processing_does_not_write_images_to_disk(self):
         email = EmailMessage()
+        email["Subject"] = "An alarm from Sprcha."
         email.set_content("Camera alert")
         email.add_attachment(jpeg_bytes(), maintype="image", subtype="jpeg", filename="person.jpg")
         imap = FakeImap()
@@ -109,7 +137,7 @@ class MessageProcessingTests(unittest.TestCase):
             original_cwd = Path.cwd()
             try:
                 os.chdir(working_dir)
-                with patch.object(watcher, "classify_image", return_value="person"):
+                with patch.object(watcher, "has_qualifying_detection", return_value=True):
                     with patch.object(watcher, "send_alert"):
                         watcher.process_message(imap, config, object(), "46", email.as_bytes())
                 self.assertEqual(list(Path(working_dir).iterdir()), [])
@@ -124,11 +152,26 @@ class MessageProcessingTests(unittest.TestCase):
         imap = FakeImap()
         config = config_for()
 
-        with patch.object(watcher, "classify_image", return_value=None):
+        with patch.object(watcher, "has_qualifying_detection", return_value=False):
             with patch.object(watcher, "send_alert") as send:
                 watcher.process_message(imap, config, object(), "43", email.as_bytes())
 
         send.assert_not_called()
+        self.assertEqual(imap.calls[-1][0], "STORE")
+
+    def test_unknown_camera_subject_is_forwarded_unchanged(self):
+        email = EmailMessage()
+        email["Subject"] = "An alarm from Garage."
+        email.set_content("Camera alert")
+        email.add_attachment(jpeg_bytes(), maintype="image", subtype="jpeg", filename="animal.jpg")
+        imap = FakeImap()
+        config = config_for()
+
+        with patch.object(watcher, "has_qualifying_detection", return_value=True):
+            with patch.object(watcher, "send_alert") as send:
+                watcher.process_message(imap, config, object(), "47", email.as_bytes())
+
+        self.assertEqual(send.call_args.args[1], "An alarm from Garage.")
         self.assertEqual(imap.calls[-1][0], "STORE")
 
     def test_delivery_failure_leaves_message_unprocessed(self):
@@ -138,23 +181,28 @@ class MessageProcessingTests(unittest.TestCase):
         imap = FakeImap()
         config = config_for()
 
-        with patch.object(watcher, "classify_image", return_value="person"):
+        with patch.object(watcher, "has_qualifying_detection", return_value=True):
             with patch.object(watcher, "send_alert", side_effect=OSError("SMTP unavailable")):
                 with self.assertRaises(OSError):
+                    email["Subject"] = "PIR Alarm for Chata at 12:00"
                     watcher.process_message(imap, config, object(), "44", email.as_bytes())
-        self.assertEqual(imap.calls, [])
-        self.assertEqual(imap.calls, [])
+            self.assertEqual(imap.calls, [])
 
-    def test_alert_email_uses_class_prefix_and_authenticated_starttls(self):
+    def test_alert_email_uses_camera_only_subject_and_authenticated_starttls(self):
         config = config_for()
         smtp = MagicMock()
         smtp.__enter__.return_value = smtp
 
         with patch.object(watcher.smtplib, "SMTP", return_value=smtp):
-            watcher.send_alert(config, "Motion detected", "camera.jpg", jpeg_bytes(), "person")
+            watcher.send_alert(config, "[Gang]", "camera.jpg", jpeg_bytes())
 
         sent_email = smtp.send_message.call_args.args[0]
-        self.assertEqual(sent_email["Subject"], "[ALERT: Person] Motion detected")
+        self.assertEqual(sent_email["Subject"], "[Gang]")
+        self.assertNotIn("ALERT", sent_email["Subject"])
+        self.assertNotIn("Motion detected", sent_email["Subject"])
+        body = sent_email.get_body(preferencelist=("plain",)).get_content()
+        self.assertNotIn("person", body)
+        self.assertNotIn("animal", body)
         smtp.starttls.assert_called_once()
         smtp.login.assert_called_once_with(config.smtp_user, config.smtp_password)
 

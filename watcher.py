@@ -5,6 +5,7 @@ from __future__ import annotations
 import imaplib
 import logging
 import os
+import re
 import smtplib
 import ssl
 import time
@@ -22,6 +23,11 @@ LOGGER = logging.getLogger("reolink_watcher")
 CONNECTION_TIMEOUT = 30
 ANIMAL_CLASSES = frozenset(
     {"bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"}
+)
+CAMERA_NAMES = ("Sprcha", "Chata", "Altanok", "Sad", "Gang")
+CAMERA_NAME_PATTERN = re.compile(
+    rf"(?<!\w)({'|'.join(CAMERA_NAMES)})(?!\w)",
+    re.IGNORECASE,
 )
 
 
@@ -86,21 +92,19 @@ class Config:
         )
 
 
-def classify_image(model: object, image_bytes: bytes, confidence_threshold: float) -> str | None:
-    """Return person, animal, or None for an image's highest-priority alert."""
+def has_qualifying_detection(model: object, image_bytes: bytes, confidence_threshold: float) -> bool:
+    """Return whether an image contains a qualifying person or animal."""
     with Image.open(BytesIO(image_bytes)) as image:
         predictions = model.predict(source=image.convert("RGB"), conf=confidence_threshold, verbose=False)
 
     if not predictions:
-        return None
+        return False
 
     result = predictions[0]
     boxes = getattr(result, "boxes", None)
     if boxes is None:
-        return None
+        return False
 
-    found_person = False
-    found_animal = False
     names = getattr(result, "names", getattr(model, "names", {}))
 
     for box in boxes:
@@ -119,14 +123,18 @@ def classify_image(model: object, image_bytes: bytes, confidence_threshold: floa
             continue
 
         normalized_name = class_name.strip().lower()
-        found_person |= normalized_name == "person"
-        found_animal |= normalized_name in ANIMAL_CLASSES
+        if normalized_name == "person" or normalized_name in ANIMAL_CLASSES:
+            return True
+    return False
 
-    if found_person:
-        return "person"
-    if found_animal:
-        return "animal"
-    return None
+
+def forwarded_subject_from_source(source_subject: str) -> str:
+    match = CAMERA_NAME_PATTERN.search(source_subject)
+    if match is None:
+        return source_subject or "Reolink camera alert"
+
+    camera_name = next(name for name in CAMERA_NAMES if name.casefold() == match.group(1).casefold())
+    return f"[{camera_name}]"
 
 
 def _scalar(value: object) -> float:
@@ -147,13 +155,12 @@ def extract_jpeg_attachments(message: Message) -> list[tuple[str, bytes]]:
     return attachments
 
 
-def send_alert(config: Config, subject: str, image_name: str, image_bytes: bytes, alert_type: str) -> None:
-    prefix = "[ALERT: Person]" if alert_type == "person" else "[ALERT: Animal]"
+def send_alert(config: Config, subject: str, image_name: str, image_bytes: bytes) -> None:
     email = EmailMessage()
     email["From"] = config.smtp_user
     email["To"] = config.target_email
-    email["Subject"] = f"{prefix} {subject or 'Reolink camera alert'}"
-    email.set_content(f"A {alert_type} was detected in a Reolink camera image.")
+    email["Subject"] = subject
+    email.set_content("A Reolink camera image matched the alert filter.")
     email.add_attachment(
         image_bytes,
         maintype="image",
@@ -172,15 +179,17 @@ def send_alert(config: Config, subject: str, image_name: str, image_bytes: bytes
 
 def process_message(imap: imaplib.IMAP4_SSL, config: Config, model: object, uid: str, raw_message: bytes) -> None:
     message = message_from_bytes(raw_message, policy=default)
-    subject = str(message.get("Subject", "Reolink camera alert"))
+    subject = str(message.get("Subject") or "Reolink camera alert")
     attachments = extract_jpeg_attachments(message)
+    forwarded_subject: str | None = None
 
     for filename, image_bytes in attachments:
-        alert_type = classify_image(model, image_bytes, config.confidence_threshold)
-        if alert_type is None:
+        if not has_qualifying_detection(model, image_bytes, config.confidence_threshold):
             continue
 
-        send_alert(config, subject, filename, image_bytes, alert_type)
+        if forwarded_subject is None:
+            forwarded_subject = forwarded_subject_from_source(subject)
+        send_alert(config, forwarded_subject, filename, image_bytes)
 
     status, _ = imap.uid("STORE", uid, "+FLAGS.SILENT", "(\\Seen)")
     if status != "OK":
