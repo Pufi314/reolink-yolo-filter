@@ -40,8 +40,9 @@ class Config:
     smtp_port: int
     smtp_user: str
     smtp_password: str
-    target_email: str
+    target_emails: tuple[str, ...]
     confidence_threshold: float
+    camera_confidence_thresholds: Mapping[str, float]
     poll_interval_seconds: int
     reconnect_delay_seconds: int
 
@@ -68,7 +69,14 @@ class Config:
             poll_interval = int(values.get("POLL_INTERVAL_SECONDS", "15"))
             reconnect_delay = int(values.get("RECONNECT_DELAY_SECONDS", "30"))
         except ValueError as error:
-            raise ValueError("SMTP_PORT, CONFIDENCE_THRESHOLD, and interval settings must be numeric") from error
+            raise ValueError(
+                "SMTP_PORT, CONFIDENCE_THRESHOLD, and interval settings must be numeric"
+            ) from error
+        camera_thresholds = _parse_camera_thresholds(values.get("CAMERA_CONFIDENCE_THRESHOLDS", ""))
+
+        target_emails = tuple(address.strip() for address in values["TARGET_EMAIL"].split(",") if address.strip())
+        if not target_emails:
+            raise ValueError("TARGET_EMAIL must contain at least one recipient address")
 
         if not 1 <= smtp_port <= 65535:
             raise ValueError("SMTP_PORT must be between 1 and 65535")
@@ -85,11 +93,36 @@ class Config:
             smtp_port=smtp_port,
             smtp_user=values["SMTP_USER"],
             smtp_password=values["SMTP_PASSWORD"],
-            target_email=values["TARGET_EMAIL"],
+            target_emails=target_emails,
             confidence_threshold=confidence,
+            camera_confidence_thresholds=camera_thresholds,
             poll_interval_seconds=poll_interval,
             reconnect_delay_seconds=reconnect_delay,
         )
+
+
+def _parse_camera_thresholds(value: str) -> dict[str, float]:
+    thresholds: dict[str, float] = {}
+    known_names = {name.casefold(): name for name in CAMERA_NAMES}
+    for entry in value.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            camera_name, raw_threshold = entry.split(":", maxsplit=1)
+            canonical_name = known_names[camera_name.strip().casefold()]
+            threshold = float(raw_threshold.strip())
+        except (ValueError, KeyError) as error:
+            raise ValueError(
+                f"Invalid CAMERA_CONFIDENCE_THRESHOLDS entry {entry!r}; "
+                "expected CameraName:0.0-1.0 for a configured camera"
+            ) from error
+        if not 0 <= threshold <= 1:
+            raise ValueError(f"Threshold for {canonical_name} must be between 0 and 1")
+        if canonical_name in thresholds:
+            raise ValueError(f"Duplicate confidence threshold for camera {canonical_name}")
+        thresholds[canonical_name] = threshold
+    return thresholds
 
 
 def has_qualifying_detection(model: object, image_bytes: bytes, confidence_threshold: float) -> bool:
@@ -129,12 +162,18 @@ def has_qualifying_detection(model: object, image_bytes: bytes, confidence_thres
 
 
 def forwarded_subject_from_source(source_subject: str) -> str:
-    match = CAMERA_NAME_PATTERN.search(source_subject)
-    if match is None:
+    camera_name = camera_name_from_subject(source_subject)
+    if camera_name is None:
         return source_subject or "Reolink camera alert"
 
-    camera_name = next(name for name in CAMERA_NAMES if name.casefold() == match.group(1).casefold())
     return f"[{camera_name}]"
+
+
+def camera_name_from_subject(source_subject: str) -> str | None:
+    match = CAMERA_NAME_PATTERN.search(source_subject)
+    if match is None:
+        return None
+    return next(name for name in CAMERA_NAMES if name.casefold() == match.group(1).casefold())
 
 
 def _scalar(value: object) -> float:
@@ -158,7 +197,7 @@ def extract_jpeg_attachments(message: Message) -> list[tuple[str, bytes]]:
 def send_alert(config: Config, subject: str, image_name: str, image_bytes: bytes) -> None:
     email = EmailMessage()
     email["From"] = config.smtp_user
-    email["To"] = config.target_email
+    email["To"] = ", ".join(config.target_emails)
     email["Subject"] = subject
     email.set_content("A Reolink camera image matched the alert filter.")
     email.add_attachment(
@@ -174,21 +213,23 @@ def send_alert(config: Config, subject: str, image_name: str, image_bytes: bytes
         client.starttls(context=context)
         client.ehlo()
         client.login(config.smtp_user, config.smtp_password)
-        client.send_message(email)
+        client.send_message(email, to_addrs=config.target_emails)
 
 
 def process_message(imap: imaplib.IMAP4_SSL, config: Config, model: object, uid: str, raw_message: bytes) -> None:
     message = message_from_bytes(raw_message, policy=default)
     subject = str(message.get("Subject") or "Reolink camera alert")
     attachments = extract_jpeg_attachments(message)
-    forwarded_subject: str | None = None
+    camera_name = camera_name_from_subject(subject)
+    forwarded_subject = forwarded_subject_from_source(subject)
+    confidence_threshold = config.camera_confidence_thresholds.get(
+        camera_name, config.confidence_threshold
+    )
 
     for filename, image_bytes in attachments:
-        if not has_qualifying_detection(model, image_bytes, config.confidence_threshold):
+        if not has_qualifying_detection(model, image_bytes, confidence_threshold):
             continue
 
-        if forwarded_subject is None:
-            forwarded_subject = forwarded_subject_from_source(subject)
         send_alert(config, forwarded_subject, filename, image_bytes)
 
     status, _ = imap.uid("STORE", uid, "+FLAGS.SILENT", "(\\Seen)")

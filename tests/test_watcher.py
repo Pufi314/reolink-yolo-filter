@@ -53,8 +53,9 @@ def config_for() -> watcher.Config:
         smtp_port=587,
         smtp_user="sender@example.com",
         smtp_password="secret",
-        target_email="recipient@example.com",
+        target_emails=("recipient@example.com",),
         confidence_threshold=0.5,
+        camera_confidence_thresholds={"Chata": 0.3},
         poll_interval_seconds=15,
         reconnect_delay_seconds=30,
     )
@@ -122,8 +123,37 @@ class MessageProcessingTests(unittest.TestCase):
                 watcher.process_message(imap, config, object(), "42", email.as_bytes())
 
         self.assertEqual(classify.call_count, 2)
+        self.assertEqual([call.args[2] for call in classify.call_args_list], [0.5, 0.5])
         self.assertEqual([call.args[1] for call in send.call_args_list], ["[Sprcha]", "[Sprcha]"])
         self.assertEqual(imap.calls[-1], ("STORE", "42", "+FLAGS.SILENT", "(\\Seen)"))
+
+    def test_camera_threshold_override_is_used_for_each_image(self):
+        email = EmailMessage()
+        email["Subject"] = "PIR Alarm for Chata at 12:00"
+        email.set_content("Camera alert")
+        email.add_attachment(jpeg_bytes(), maintype="image", subtype="jpeg", filename="animal.jpg")
+        imap = FakeImap()
+        config = config_for()
+
+        with patch.object(watcher, "has_qualifying_detection", return_value=True) as classify:
+            with patch.object(watcher, "send_alert"):
+                watcher.process_message(imap, config, object(), "48", email.as_bytes())
+
+        self.assertEqual(classify.call_args.args[2], 0.3)
+
+    def test_unknown_camera_uses_default_confidence_threshold(self):
+        email = EmailMessage()
+        email["Subject"] = "Unknown camera triggered"
+        email.set_content("Camera alert")
+        email.add_attachment(jpeg_bytes(), maintype="image", subtype="jpeg", filename="animal.jpg")
+        imap = FakeImap()
+        config = config_for()
+
+        with patch.object(watcher, "has_qualifying_detection", return_value=True) as classify:
+            with patch.object(watcher, "send_alert"):
+                watcher.process_message(imap, config, object(), "49", email.as_bytes())
+
+        self.assertEqual(classify.call_args.args[2], config.confidence_threshold)
 
     def test_processing_does_not_write_images_to_disk(self):
         email = EmailMessage()
@@ -205,6 +235,9 @@ class MessageProcessingTests(unittest.TestCase):
         self.assertNotIn("animal", body)
         smtp.starttls.assert_called_once()
         smtp.login.assert_called_once_with(config.smtp_user, config.smtp_password)
+        smtp.send_message.assert_called_once_with(
+            sent_email, to_addrs=config.target_emails
+        )
 
 
 class RetryTests(unittest.TestCase):
@@ -220,12 +253,8 @@ class RetryTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
-    def test_configuration_requires_credentials(self):
-        with self.assertRaisesRegex(ValueError, "IMAP_SERVER"):
-            watcher.Config.from_env({})
-
-    def test_configuration_rejects_out_of_range_confidence(self):
-        env = {
+    def valid_env(self):
+        return {
             "IMAP_SERVER": "imap.example.com",
             "IMAP_USER": "inbox@example.com",
             "IMAP_PASSWORD": "secret",
@@ -233,9 +262,45 @@ class ConfigurationTests(unittest.TestCase):
             "SMTP_PORT": "587",
             "SMTP_USER": "sender@example.com",
             "SMTP_PASSWORD": "secret",
-            "TARGET_EMAIL": "recipient@example.com",
-            "CONFIDENCE_THRESHOLD": "1.1",
+            "TARGET_EMAIL": "one@example.com, two@example.com",
         }
+
+    def test_configuration_requires_credentials(self):
+        with self.assertRaisesRegex(ValueError, "IMAP_SERVER"):
+            watcher.Config.from_env({})
+
+    def test_configuration_parses_multiple_recipients_and_camera_thresholds(self):
+        env = self.valid_env()
+        env["CAMERA_CONFIDENCE_THRESHOLDS"] = "Sprcha:0.2, Chata:0.35"
+
+        config = watcher.Config.from_env(env)
+
+        self.assertEqual(config.target_emails, ("one@example.com", "two@example.com"))
+        self.assertEqual(config.camera_confidence_thresholds, {"Sprcha": 0.2, "Chata": 0.35})
+
+    def test_configuration_accepts_one_recipient(self):
+        env = self.valid_env()
+        env["TARGET_EMAIL"] = "one@example.com"
+
+        self.assertEqual(watcher.Config.from_env(env).target_emails, ("one@example.com",))
+
+    def test_configuration_rejects_unknown_camera_threshold(self):
+        env = self.valid_env()
+        env["CAMERA_CONFIDENCE_THRESHOLDS"] = "Garage:0.3"
+
+        with self.assertRaisesRegex(ValueError, "CAMERA_CONFIDENCE_THRESHOLDS"):
+            watcher.Config.from_env(env)
+
+    def test_configuration_rejects_out_of_range_camera_threshold(self):
+        env = self.valid_env()
+        env["CAMERA_CONFIDENCE_THRESHOLDS"] = "Sprcha:1.1"
+
+        with self.assertRaisesRegex(ValueError, "between 0 and 1"):
+            watcher.Config.from_env(env)
+
+    def test_configuration_rejects_out_of_range_confidence(self):
+        env = self.valid_env()
+        env["CONFIDENCE_THRESHOLD"] = "1.1"
         with self.assertRaisesRegex(ValueError, "CONFIDENCE_THRESHOLD"):
             watcher.Config.from_env(env)
 

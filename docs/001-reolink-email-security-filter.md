@@ -21,12 +21,12 @@ The service has no interactive UI. It exposes its status through container logs 
 
 - Python 3.11 slim container with `imaplib`, `smtplib`, Pillow, and `ultralytics`; use `yolov8n.pt` and CPU inference by default.
 - Poll the configured IMAP inbox for unprocessed messages, parse MIME attachments, and evaluate each JPEG independently. Reconnect after transient failures with bounded connection timeouts and retry delay.
-- Use SMTP with TLS and `SMTP_USER`/`SMTP_PASSWORD` to send a new email to `TARGET_EMAIL`, attaching the original image. Set the forwarded subject to only the recognized camera name in brackets (for example, `[Sprcha]`), extracted from the source subject.
-- Use the model's COCO classes and `CONFIDENCE_THRESHOLD`. Forward an image if it contains any qualifying person or supported animal detection; do not distinguish between these detections in the email subject or body. Images with neither are discarded without notification.
+- Use SMTP with TLS and `SMTP_USER`/`SMTP_PASSWORD` to send a new email to all comma-separated addresses in `TARGET_EMAIL`, attaching the original image. Set the forwarded subject to only the recognized camera name in brackets (for example, `[Sprcha]`), extracted from the source subject.
+- Use the model's COCO classes and the camera-specific threshold from `CAMERA_CONFIDENCE_THRESHOLDS`, falling back to `CONFIDENCE_THRESHOLD`. Forward an image if it contains any qualifying person or supported animal detection; do not distinguish between these detections in the email subject or body. Images with neither are discarded without notification.
 - Recognize the five configured camera names (`Sprcha`, `Chata`, `Altanok`, `Sad`, `Gang`) as case-insensitive whole words in the incoming subject. If a name is found, use only that canonical name in brackets as the forwarded subject. Otherwise, preserve the original source subject.
 - Keep image bytes in memory for inference and email delivery; do not create NAS photo copies.
 - Persist only the Ultralytics runtime configuration/cache on the NAS. Camera images are not written to that mount.
-- Configure IMAP and SMTP host/account settings, destination, and model confidence threshold through environment variables and Compose. `ANIMAL_STRIDE` is omitted because the user confirmed it was a mistake and all animal images must be analyzed.
+- Configure IMAP and SMTP host/account settings, comma-separated destinations, and default/per-camera confidence thresholds through environment variables and Compose. `ANIMAL_STRIDE` is omitted because the user confirmed it was a mistake and all animal images must be analyzed.
 
 ### Decisions
 
@@ -42,7 +42,7 @@ The service has no interactive UI. It exposes its status through container logs 
 - IMAP message: source mailbox identifier, message identifier, source subject, and zero or more JPEG attachments.
 - Image result: attachment bytes, detected class names and confidence scores, and one outcome: qualifying person/animal alert or discard.
 - Camera identity: one of `Sprcha`, `Chata`, `Altanok`, `Sad`, or `Gang`, parsed from the source email subject.
-- Runtime configuration: IMAP server/user/password, SMTP server/port/user/password, target email, and confidence threshold. Secrets are supplied at runtime and not baked into the image.
+- Runtime configuration: IMAP server/user/password, SMTP server/port/user/password, recipient list, default confidence threshold, and optional per-camera confidence thresholds. Secrets are supplied at runtime and not baked into the image.
 
 ## Behaviors
 
@@ -51,6 +51,10 @@ The service has no interactive UI. It exposes its status through container logs 
 - `shouldDiscardImagesWithoutPersonOrAnimal`: Images containing only insects, shadows, tree motion, or other non-person/non-animal detections produce no notification.
   Type: api
 - `shouldNotPersistCameraImagesOnNas`: Camera image bytes are used in memory for inference and email delivery but are never written to a NAS-mounted photo archive.
+  Type: api
+- `shouldUsePerCameraConfidenceThresholds`: Each camera uses its configured threshold override when present and otherwise uses the global confidence threshold.
+  Type: api
+- `shouldSendAlertsToEveryConfiguredRecipient`: Every forwarded alert is addressed to all comma-separated addresses in `TARGET_EMAIL`.
   Type: api
 - `shouldRetryInboxProcessingAfterTransientNetworkFailure`: IMAP/SMTP timeouts or temporary network failures cause reconnection and retry without permanently consuming the source message.
   Type: api
