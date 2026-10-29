@@ -19,7 +19,7 @@
    - If your account uses multi-factor authentication, create a provider-approved app password for IMAP and SMTP rather than using your normal sign-in password. The optional `POLL_INTERVAL_SECONDS` and `RECONNECT_DELAY_SECONDS` control inbox polling and retry delays.
 
    Keep the real `.env` private; Compose loads it into the container and `.gitignore` excludes it from Git. Do not start the service with the untouched example credentials.
-3. Set `PUID` and `PGID` to the numeric user and group IDs that have read/write access to `data/model-cache`. Create that directory under the project directory and grant the account access.
+3. The repository includes `data/model-cache` for the Ultralytics runtime configuration bind mount. Keep that folder beside `docker-compose.yml` when copying the project to the NAS. Set `PUID` and `PGID` to the numeric user and group IDs that have read/write access to it, then grant that account access in File Station.
 4. Build and start the project. The image installs CPU-only PyTorch and downloads `yolov8n.pt` at build time. Only Ultralytics runtime configuration is mounted outside the container; alert photos are not saved by the service.
 5. Check the project’s container logs in Container Manager. The service polls the INBOX and sends one email per qualifying JPEG attachment, using the camera name alone (for example, `[Sprcha]`) as the subject when recognized, or preserving the original subject otherwise. Image bytes are held in memory while being processed and sent; there is no NAS photo archive.
 
